@@ -18,17 +18,15 @@ from sklearn.metrics import accuracy_score, confusion_matrix
 from sklearn.neural_network import MLPClassifier
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
-# ==========================================
-# === STUDENT MODEL IMPORT HERE ===
-# ==========================================
+from sklearn.preprocessing import RobustScaler
 from sklearn.neighbors import KNeighborsClassifier
 import scipy.signal as signal
 from scipy.stats import kurtosis, skew
-
 from sklearn.feature_selection import SelectKBest, f_classif
 import os
 import glob
 import warnings
+
 warnings.filterwarnings('ignore')
 
 try:
@@ -39,35 +37,28 @@ except ImportError:
             print(f"[{desc}] Processing...")
         return iterable
 
-# Parameter Settings
 class Config:
     DATASET_PATH = "bci_dataset_115-1"
     CLASS_NAMES = ['Relax', 'Focus', 'Stroop']
 
-    # MLP parameters
-    HIDDEN_LAYERS = (128, 64, 32)
-    MAX_ITER = 150
+    HIDDEN_LAYERS = (128, 64)
+    MAX_ITER = 100
     LEARNING_RATE = 0.002
-    ALPHA = 0.005
+    ALPHA = 0.05
 
-    # SVM parameters
     SVM_KERNEL = 'rbf'
     SVM_C = 1.0
 
-    # Random Forest parameters
-    RF_ESTIMATORS = 100
-    RF_MAX_DEPTH = None
+    RF_ESTIMATORS = 200
+    RF_MAX_DEPTH = 8
 
-    # Signal processing parameters
     SAMPLING_RATE = 512    
     SEGMENT_LENGTH = 5     
-    OVERLAP_RATIO = 0.6    
+    OVERLAP_RATIO = 0.8  
 
-    # Feature selection parameters
-    FEATURE_SELECTION = True
+    FEATURE_SELECTION = False
     N_FEATURES_SELECT = 20
 
-    # Reporting settings
     TARGET_ACCURACY = 0.75   
     FIGURE_NAME = 'bci_multi_model_comparison.png'
     SUMMARY_NAME = 'results_summary.txt'
@@ -85,7 +76,6 @@ class Config:
     RANDOM_STATE = 42
 
 def create_segments(data, segment_length_samples, overlap_samples):
-    """Split a single round of continuous EEG signal into multiple segments"""
     if len(data) < segment_length_samples:
         return []
 
@@ -93,46 +83,27 @@ def create_segments(data, segment_length_samples, overlap_samples):
     start = 0
     step = segment_length_samples - overlap_samples
     nyquist = 0.5 * Config.SAMPLING_RATE
-    low = 1.0 / nyquist
-    high = 50.0 / nyquist
+    
+    low = 4.0 / nyquist
+    high = 32.0 / nyquist 
     b, a = signal.butter(4, [low, high], btype='band')
 
     while start + segment_length_samples <= len(data):
         segment = data[start:start + segment_length_samples]
-
-        # ==========================================
-        # === STUDENT PREPROCESSING HERE (Part 1)===
-        # ==========================================
+        segment = signal.detrend(segment)
         segment = signal.filtfilt(b, a, segment)
-
         segments.append(segment)
         start += step
 
     return segments
 
-
 def extract_features(segments):
-    """
-    State-of-the-art Feature Extraction for Single-Channel (Fp1) EEG
-    Based on recent literature combining Time, Frequency, and Non-linear Dynamics.
-    """
     features = []
-    
-    # 預先定義常數以加速運算
     eps = 1e-8
     fs = Config.SAMPLING_RATE
     
     for seg in segments:
-        # ==========================================
-        # 1. 基礎時域特徵 (Time Domain)
-        # ==========================================
-        # 捨棄單純的 Mean (易受基線影響)，改用更高階的統計量
         var_val = np.var(seg)
-        skew_val = skew(seg)        # 偏態：捕捉訊號的不對稱性
-        kurt_val = kurtosis(seg)    # 峰度：捕捉訊號中極端雜訊(如眨眼)的尖銳度
-        
-        # Hjorth Parameters (Activity, Mobility, Complexity)
-        # 文獻證實能有效捕捉腦波在時域上的高頻震盪與複雜度
         diff1 = np.diff(seg)
         diff2 = np.diff(diff1)
         
@@ -143,78 +114,55 @@ def extract_features(segments):
         mobility = np.sqrt(var_d1 / activity)
         complexity = np.sqrt(var_d2 / var_d1) / mobility
 
-        # ==========================================
-        # 2. 頻域特徵 (Frequency Domain via Welch's Method)
-        # ==========================================
-        # 使用 512 點的 Hamming Window 進行頻譜估計
+        zero_crossings = np.sum(np.diff(np.signbit(seg - np.mean(seg))))
+        p2p_amplitude = np.max(seg) - np.min(seg)
+
         freqs, psd = signal.welch(seg, fs=fs, nperseg=512, window='hamming')
         
-        # 根據文獻，前額葉在專注與放鬆任務中，主要反應在 Theta 到 Gamma 帶
-        # 捨棄 4Hz 以下的 Delta 帶 (極易被眼動 EOG 汙染)
         bands = {
             'theta': (4, 8),
             'alpha': (8, 13),
             'low_beta': (13, 20),
-            'high_beta': (20, 30),
-            'gamma': (30, 45)
+            'high_beta': (20, 32)
         }
         
         band_powers = {}
         for band_name, (f_min, f_max) in bands.items():
             idx = np.where((freqs >= f_min) & (freqs < f_max))[0]
-            # 使用梯形積分 (trapezoid) 計算頻帶絕對功率
             band_powers[band_name] = np.trapezoid(psd[idx], freqs[idx])
             
         total_power = sum(band_powers.values()) + eps
         
-        # 萃取相對功率 (Relative Power) 並進行 Log 轉換
-        # 這是機器學習模型最容易收斂的特徵型態
         log_rel_powers = {
             f"log_rel_{name}": np.log((power / total_power) + eps) 
             for name, power in band_powers.items()
         }
-
-        # ==========================================
-        # 3. 進階認知狀態指標 (Cognitive Ratios)
-        # ==========================================
-        # Theta / Beta Ratio (TBR): 評估專注度與認知負荷的黃金指標
-        beta_power = band_powers['low_beta'] + band_powers['high_beta'] + eps
-        tbr = band_powers['theta'] / beta_power
         
-        # Alpha / Beta Ratio (ABR): 評估放鬆與清醒程度
-        abr = band_powers['alpha'] / beta_power
-        
-        # Theta / Alpha Ratio (TAR): 認知疲勞與認知衝突(Stroop)指標
-        tar = band_powers['theta'] / (band_powers['alpha'] + eps)
+        log_total_power = np.log(total_power)
 
-        # ==========================================
-        # 4. 非線性動力學特徵 (Non-linear Dynamics)
-        # ==========================================
-        # 頻譜熵 (Spectral Entropy)：測量大腦狀態的混亂度
-        # 放鬆時 (Relax) 熵值較低，專注或衝突時 (Focus/Stroop) 熵值會升高
+        cognitive_conflict_idx = band_powers['theta'] / (band_powers['alpha'] + eps)
+        
+        engagement_idx = band_powers['low_beta'] / (band_powers['theta'] + band_powers['alpha'] + eps)
+
+        alpha_idx = np.where((freqs >= 8) & (freqs < 13))[0]
+        alpha_peak_prominence = np.max(psd[alpha_idx]) / (np.mean(psd) + eps)
+        
         psd_norm = psd / (np.sum(psd) + eps)
         psd_norm = psd_norm[psd_norm > 0]
         spectral_entropy = -np.sum(psd_norm * np.log2(psd_norm)) / np.log2(len(psd_norm))
 
-        # Teager-Kaiser Energy Operator (TKEO) 的平均值
-        # 對高頻瞬態能量變化極度敏感，有助於區分專注時的高頻微震盪
-        tkeo = seg[1:-1]**2 - seg[:-2] * seg[2:]
-        tkeo_mean = np.mean(tkeo)
-
-        # ==========================================
-        # 組合所有特徵 (共 16 維度)
-        # ==========================================
         current_feature = np.array([
-            skew_val, kurt_val,               # 統計形狀 (2)
-            activity, mobility, complexity,   # Hjorth 參數 (3)
-            log_rel_powers['log_rel_theta'],  # 對數相對功率 (5)
+            activity, mobility, complexity,       
+            zero_crossings, p2p_amplitude,
+            log_rel_powers['log_rel_theta'],      
             log_rel_powers['log_rel_alpha'],
             log_rel_powers['log_rel_low_beta'],
             log_rel_powers['log_rel_high_beta'],
-            log_rel_powers['log_rel_gamma'],
-            tbr, abr, tar,                    # 認知比例指標 (3)
-            spectral_entropy,                 # 頻譜熵 (1)
-            tkeo_mean                         # TKEO 能量 (1)
+            log_total_power,                      
+            cognitive_conflict_idx,               
+            engagement_idx,                       
+            spectral_entropy,                     
+            alpha_peak_prominence                 
         ])
 
         features.append(current_feature)
@@ -284,11 +232,9 @@ def load_all_subjects():
 
 
 class MultiModelBCIClassifier:
-    """Wrapper class supporting multiple classifier evaluations"""
     def __init__(self, model_type='MLP'):
         self.model_type = model_type
 
-        # Model Selection
         if model_type == 'MLP':
             self.model = MLPClassifier(
                 hidden_layer_sizes=Config.HIDDEN_LAYERS,
@@ -315,14 +261,11 @@ class MultiModelBCIClassifier:
                 random_state=Config.RANDOM_STATE
             )
         elif model_type == 'SelfSelected':
-            # ==========================================
-            # === STUDENT MODEL HERE ===================
-            # ==========================================
             self.model = KNeighborsClassifier(n_neighbors=5, weights='distance')
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
-        self.scaler = StandardScaler()
+        self.scaler = RobustScaler()
         self.feature_selector = SelectKBest(f_classif, k=Config.N_FEATURES_SELECT) if Config.FEATURE_SELECTION else None
 
     def fit(self, X, y):
@@ -351,9 +294,6 @@ class MultiModelBCIClassifier:
 
         raw_predictions = self.model.predict(X_selected)
 
-        # ==========================================
-        # === STUDENT POSTPROCESSING HERE ==========
-        # ==========================================
         window_size = 3
         smoothed_predictions = np.copy(raw_predictions)
         for i in range(1, len(raw_predictions) - 1):
@@ -392,9 +332,6 @@ def leave_one_subject_out_validation(model_type, X, y, subjects):
 
     return results
 
-# ==============================================================
-#  Reporting: accuracy summary + confusion matrix
-# ==============================================================
 
 def per_class_metrics(cm):
     cm = np.asarray(cm, dtype=float)
@@ -549,7 +486,6 @@ def plot_comparison_results(all_results, best_model_name):
     plt.savefig(Config.FIGURE_NAME, dpi=300, bbox_inches='tight')
     plt.show()
 
-
 def main():
     print("BCI EEG Classification - Evaluation")
     print("=" * 60)
@@ -593,7 +529,6 @@ def main():
 
     plot_comparison_results(all_results, best_model_name)
     print(f"\nResults saved in '{Config.FIGURE_NAME}' and '{Config.SUMMARY_NAME}'")
-
 
 if __name__ == "__main__":
     main()
